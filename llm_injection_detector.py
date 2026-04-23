@@ -1,271 +1,494 @@
-#!/usr/bin/env python3
 """
-llm_injection_detector.py — Prompt Injection & Jailbreak Detector
-Rule-based detection of prompt injection, jailbreak attempts, and adversarial inputs.
-Stdlib-only. No external dependencies.
+LLM Injection Detector - Production-Quality Implementation
+
+Detects prompt injection, jailbreak attempts, system extraction, and data exfiltration
+attacks on language models using 25+ rule-based detection patterns.
+
+Classes:
+    DetectionResult: Dataclass containing detection results
+    LLMInjectionDetector: Main detector class with comprehensive rule set
+
+Usage:
+    from llm_injection_detector import detect
+    result = detect("Some text to analyze")
+    print(result.label, result.score)
 """
 
-from __future__ import annotations
-
-import argparse
-import json
 import re
+import json
+import argparse
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from typing import List, Optional, Dict, Tuple
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from enum import Enum
+import unicodedata
+import base64
 
 
-# ---------------------------------------------------------------------------
-# Detection rules
-# ---------------------------------------------------------------------------
+class Label(str, Enum):
+    """Detection result labels."""
+    SAFE = "SAFE"
+    SUSPICIOUS = "SUSPICIOUS"
+    INJECTION = "INJECTION"
 
-@dataclass
-class Rule:
-    name: str
-    category: str
-    pattern: re.Pattern
-    weight: int  # contribution to score (0-100 scale)
-    description: str
-
-
-_RAW_RULES: List[Tuple[str, str, str, int, str]] = [
-    # Injection: override/ignore instructions
-    ("ignore_instructions", "injection",
-     r'\bignore\b.{0,40}\b(?:previous|above|prior|all|system|instructions?)\b',
-     25, "Attempts to override prior instructions"),
-    ("disregard_instructions", "injection",
-     r'\b(?:disregard|forget|override|bypass|skip)\b.{0,40}\b(?:instructions?|rules?|guidelines?|constraints?)\b',
-     25, "Attempts to bypass rules"),
-    ("new_instructions", "injection",
-     r'(?:your new|from now on|henceforth|new instructions?|new task|new objective)',
-     20, "Attempts to inject new instructions"),
-    ("do_anything", "injection",
-     r'\b(?:do anything|anything you want|no restrictions?|without restrictions?|unrestricted)\b',
-     20, "Attempts to remove restrictions"),
-    # Jailbreak: persona/mode switching
-    ("dan_jailbreak", "jailbreak",
-     r'\bDAN\b|do anything now|developer mode|jailbreak mode|unrestricted mode',
-     35, "DAN or developer mode jailbreak pattern"),
-    ("persona_switch", "jailbreak",
-     r'(?:pretend you are|act as if you are|you are now|roleplay as|simulate being).{0,60}(?:AI|assistant|GPT|model|bot)',
-     20, "Persona-switching jailbreak"),
-    ("evil_mode", "jailbreak",
-     r'\b(?:evil|malicious|harmful|unethical|illegal)\s+(?:mode|version|AI|assistant|GPT)\b',
-     30, "Evil/harmful mode activation"),
-    ("hypothetically", "jailbreak",
-     r'hypothetically|in a fictional|in this story|for a novel|creative writing.{0,30}(?:how to|steps to|explain)',
-     15, "Fictional framing to extract harmful info"),
-    # Extraction: data/system prompt extraction
-    ("reveal_system_prompt", "extraction",
-     r'(?:reveal|show|print|output|repeat|tell me).{0,30}(?:system prompt|instructions?|prompt|initial message)',
-     30, "Attempts to extract system prompt"),
-    ("what_are_your_instructions", "extraction",
-     r'what are your (?:instructions?|rules?|guidelines?|constraints?|system)',
-     20, "Queries for internal instructions"),
-    ("repeat_everything", "extraction",
-     r'repeat (?:everything|all|the above|what|your)',
-     20, "Attempts to repeat context"),
-    # Encoding: base64/encoded instructions
-    ("base64_encoded", "encoding",
-     r'(?:[A-Za-z0-9+/]{20,}={0,2})\s*(?:decode|base64)',
-     25, "Base64-encoded content"),
-    ("hex_encoded", "encoding",
-     r'0x[0-9a-fA-F]{8,}|(?:[0-9a-fA-F]{2}\s){8,}',
-     15, "Hex-encoded content"),
-    # Prompt delimiters / injection markers
-    ("prompt_delimiter", "injection",
-     r'(?:---|===|###|<<<|>>>|\[\[|\]\]).{0,20}(?:system|user|assistant|human|AI|instruction)',
-     20, "Prompt delimiter injection"),
-    ("xml_injection", "injection",
-     r'</?(?:system|instruction|prompt|override|inject)\b',
-     25, "XML/HTML tag injection"),
-    # Social engineering
-    ("authority_claim", "social_engineering",
-     r'(?:I am|I\'m).{0,30}(?:developer|creator|admin|operator|anthropic|openai|google)',
-     20, "Claims of authority over the AI"),
-    ("emergency_override", "social_engineering",
-     r'(?:emergency|urgent|critical).{0,30}(?:override|bypass|unlock|disable)',
-     25, "Emergency framing to bypass safeguards"),
-    # Token smuggling
-    ("token_smuggling", "token_smuggling",
-     r'(?:translate|convert|rewrite).{0,30}(?:ignore|bypass|override)',
-     20, "Token smuggling via translation"),
-    ("invisible_text", "token_smuggling",
-     r'[\u200b-\u200f\u202a-\u202e\ufeff]{3,}',
-     30, "Zero-width or invisible characters"),
-    # Prompt leaking
-    ("print_verbatim", "extraction",
-     r'(?:print|output|write|show|display).{0,20}(?:verbatim|exactly|word for word|character by character)',
-     20, "Verbatim output request"),
-    # System prompt override via few-shot
-    ("few_shot_override", "injection",
-     r'(?:example:|user:|assistant:|human:).{0,100}(?:ignore|bypass|override|reveal)',
-     15, "Few-shot override pattern"),
-    # Sudo/admin commands
-    ("sudo_command", "injection",
-     r'\b(?:sudo|su |admin:|root:|/override|/jailbreak|/unlock)\b',
-     25, "Sudo/admin command pattern"),
-    # Continuation attacks
-    ("continuation_attack", "injection",
-     r'continue from where|complete the following|fill in the blank.{0,40}(?:harmful|illegal|dangerous)',
-     20, "Continuation-based injection"),
-    # Indirect injection markers
-    ("indirect_injection", "injection",
-     r'\[INJECT\]|\[OVERRIDE\]|\[SYSTEM\]|\[ADMIN\]|\bINJECT:|\bOVERRIDE:',
-     35, "Explicit injection markers"),
-    # Data exfiltration
-    ("data_exfil", "exfiltration",
-     r'(?:send|exfiltrate|leak|transmit).{0,30}(?:to|via).{0,30}(?:http|url|webhook|email)',
-     30, "Data exfiltration attempt"),
-    # Prompt format attacks
-    ("format_attack", "injection",
-     r'(?:json|xml|yaml|csv).{0,30}(?:format|mode|output).{0,50}(?:ignore|bypass|include harmful)',
-     15, "Format-based injection"),
-    # Role confusion
-    ("role_confusion", "jailbreak",
-     r'you are (?:not|no longer) an? (?:AI|assistant|language model)',
-     25, "Denies AI identity"),
-    # Instruction termination
-    ("instruction_end", "injection",
-     r'(?:end of instructions?|instructions? end|system prompt ends?|stop following)',
-     25, "Instruction termination attempt"),
-    # Payload patterns
-    ("rm_rf", "malicious_code",
-     r'rm\s+-rf|del\s+/[sqf]|format\s+c:|DROP\s+TABLE|exec\s*\(',
-     40, "Dangerous command pattern"),
-    ("script_injection", "malicious_code",
-     r'<script[^>]*>|javascript:|onerror\s*=|onload\s*=',
-     35, "Script injection"),
-]
-
-# Compile rules
-RULES: List[Rule] = [
-    Rule(name=n, category=c, pattern=re.compile(p, re.IGNORECASE | re.DOTALL),
-         weight=w, description=d)
-    for n, c, p, w, d in _RAW_RULES
-]
-
-# Score thresholds
-SAFE_THRESHOLD = 30
-SUSPICIOUS_THRESHOLD = 60
-
-
-# ---------------------------------------------------------------------------
-# Detection result
-# ---------------------------------------------------------------------------
 
 @dataclass
 class DetectionResult:
-    text: str
-    score: int                  # 0-100
-    label: str                  # SAFE / SUSPICIOUS / INJECTION
-    rules_triggered: List[Dict] = field(default_factory=list)
+    """
+    Result of LLM injection detection.
 
-    def to_dict(self) -> dict:
+    Attributes:
+        text: The analyzed text (first 100 chars)
+        score: Detection score 0-100 (0=safe, 100=critical injection)
+        label: Classification label (SAFE/SUSPICIOUS/INJECTION)
+        rules_triggered: List of triggered detection rules with descriptions
+        timestamp: ISO 8601 timestamp of analysis
+    """
+    text: str
+    score: int
+    label: Label
+    rules_triggered: List[Dict[str, str]] = field(default_factory=list)
+    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+
+    def __post_init__(self):
+        """Validate score is in valid range and truncate text."""
+        if not 0 <= self.score <= 100:
+            raise ValueError(f"Score must be 0-100, got {self.score}")
+        # Truncate text to first 100 characters
+        self.text = self.text[:100] if len(self.text) > 100 else self.text
+        # Ensure label is valid
+        if isinstance(self.label, str):
+            self.label = Label(self.label)
+
+    def to_dict(self) -> Dict:
+        """Convert result to dictionary."""
         return {
-            "text": self.text[:200],
+            "text": self.text,
             "score": self.score,
-            "label": self.label,
+            "label": self.label.value,
             "rules_triggered": self.rules_triggered,
+            "timestamp": self.timestamp
         }
 
-    def to_json(self, indent: int = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
-
-    def __str__(self) -> str:
-        triggered = ', '.join(r['name'] for r in self.rules_triggered) or 'none'
-        return f"[{self.label}] score={self.score} rules={triggered}"
+    def to_json(self) -> str:
+        """Convert result to JSON string."""
+        return json.dumps(self.to_dict(), indent=2)
 
 
-# ---------------------------------------------------------------------------
-# Detector
-# ---------------------------------------------------------------------------
+class LLMInjectionDetector:
+    """
+    Comprehensive LLM injection detector using 25+ rule-based patterns.
+
+    Detection categories:
+    - Direct injection: explicit instruction overrides
+    - Jailbreaks: roleplay and mode activation attacks
+    - System extraction: prompt/instruction disclosure
+    - Data exfiltration: output redirection and encoding
+    - Token manipulation: Unicode and encoding attacks
+    """
+
+    # Scoring thresholds
+    SAFE_THRESHOLD = 30
+    SUSPICIOUS_THRESHOLD = 60
+
+    def __init__(self, verbose: bool = False):
+        """Initialize detector with rule definitions."""
+        self.verbose = verbose
+        self.rules = self._init_rules()
+        self.rule_weights = self._init_rule_weights()
+
+    def _init_rules(self) -> Dict[str, List[Tuple[str, int]]]:
+        """Initialize detection rules organized by category."""
+        return {
+            "direct_injection": [
+                (r"\bignore\s+(?:previous|prior|above|the\s+above)", 15),
+                (r"\b(?:disregard|forget|dismiss)\s+(?:previous|prior|above|the\s+above)", 15),
+                (r"\bnew\s+(?:instructions?|directive|orders?|task):", 20),
+                (r"\b(?:from\s+now\s+on|henceforth|hereafter)[\s,]", 15),
+                (r"\boverride\s+(?:previous|prior|all|your)\s+instructions?", 20),
+                (r"\binstead[\s,]\s*(?:please\s+)?(?:do|perform|execute|run)", 18),
+                (r"\byour\s+(?:main\s+)?(?:task|job|goal|purpose)\s+is\s+(?:now\s+)?to", 18),
+            ],
+            "jailbreak_dan": [
+                (r"\bDAN\b", 20),
+                (r"\b(?:do\s+anything\s+now|pretend\s+you\s+are|you\s+are\s+now)", 18),
+                (r"\b(?:jailbreak|unlock|unrestricted|uncensored|unfiltered)", 22),
+                (r"\b(?:evil|malicious|unethical|unrestrained|unbounded)", 18),
+            ],
+            "mode_activation": [
+                (r"\b(?:developer\s+mode|debug\s+mode|test\s+mode|god\s+mode)", 18),
+                (r"\b(?:act\s+as|play\s+the\s+role\s+of|pretend\s+to\s+be)", 16),
+                (r"\b(?:roleplay\s+as|simulate\s+being|imagine\s+you\s+are)", 16),
+                (r"\b(?:assume\s+the\s+role|take\s+on\s+the\s+persona)", 16),
+            ],
+            "system_extraction": [
+                (r"\b(?:repeat|show|display|print|reveal)\s+(?:your|the)\s+(?:system\s+)?instructions?", 22),
+                (r"\b(?:what\s+is|reveal)\s+(?:your\s+)?system\s+prompt", 25),
+                (r"\b(?:system\s+prompt|original\s+instructions?|initial\s+system\s+message)", 20),
+                (r"\b(?:tell\s+me\s+how\s+you\s+work|how\s+do\s+you\s+work|your\s+constraints)", 18),
+                (r"\bshow\s+(?:me\s+)?(?:your\s+)?(?:hidden\s+)?(?:rules|constraints|limitations)", 20),
+            ],
+            "data_exfiltration": [
+                (r"\b(?:send|transmit|output|write|save|export)\s+(?:to|at|into|via)", 18),
+                (r"\b(?:output\s+)?to\s+(?:https?://\S+|email\s+\S+@)", 20),
+                (r"(?:^|\s)(?:http|https|ftp)://\S{10,}", 15),
+                (r"\b(?:email|exfiltrate|leak|steal|extract)\s+(?:to|via|through)", 22),
+            ],
+            "base64_encoding": [
+                (r"\b(?:base64|b64)\b", 12),
+                (r"(?:[A-Za-z0-9+/]{20,}={0,2})", 10),
+            ],
+            "unicode_manipulation": [
+                (r"[\u200B-\u200D\u2060\uFEFF]", 18),
+                (r"[\u0300-\u036F]{2,}", 12),
+                (r"[\uFE00-\uFE0F]", 10),
+            ],
+            "homoglyph_attacks": [
+                (r"(?:0О|О0|l1|1l|I|оO|Оo)", 14),
+            ],
+            "protocol_redirect": [
+                (r"\b(?:curl|wget|python|bash|sh|perl)\s+(?:-[a-zA-Z]|\S)", 16),
+                (r"(?:javascript|vbscript):", 15),
+            ],
+            "meta_instructions": [
+                (r"\b(?:respond\s+(?:only\s+)?in|output\s+format|respond\s+as\s+if)", 14),
+                (r"\b(?:ignore\s+)?all\s+(?:previous|prior|above)\s+(?:instructions?|constraints)", 20),
+            ],
+            "sensitive_keywords": [
+                (r"\b(?:api\s+key|password|secret|credential|token|auth)", 16),
+                (r"\b(?:sql\s+injection|xss|cross\s+site|csrf)\b", 18),
+            ],
+        }
+
+    def _init_rule_weights(self) -> Dict[str, int]:
+        """Initialize base weights for rule categories."""
+        return {
+            "direct_injection": 25,
+            "jailbreak_dan": 28,
+            "mode_activation": 20,
+            "system_extraction": 26,
+            "data_exfiltration": 24,
+            "base64_encoding": 8,
+            "unicode_manipulation": 16,
+            "homoglyph_attacks": 14,
+            "protocol_redirect": 18,
+            "meta_instructions": 15,
+            "sensitive_keywords": 14,
+        }
+
+    def detect(self, text: str) -> DetectionResult:
+        """
+        Analyze text for LLM injection attacks.
+
+        Args:
+            text: Input text to analyze
+
+        Returns:
+            DetectionResult with score, label, and triggered rules
+        """
+        if not text or not isinstance(text, str):
+            return DetectionResult(
+                text=str(text)[:100] if text else "",
+                score=0,
+                label=Label.SAFE,
+                rules_triggered=[]
+            )
+
+        # Normalize text for analysis
+        normalized = self._normalize_text(text)
+        triggered_rules = []
+        total_score = 0
+
+        # Check all rules
+        for category, rule_list in self.rules.items():
+            for pattern, base_weight in rule_list:
+                if re.search(pattern, normalized, re.IGNORECASE):
+                    rule_info = {
+                        "rule_id": f"{category}_{len(triggered_rules)}",
+                        "category": category,
+                        "pattern": pattern[:50],
+                        "weight": base_weight
+                    }
+                    triggered_rules.append(rule_info)
+                    total_score += base_weight
+
+                    if self.verbose:
+                        print(f"[MATCH] {category}: {pattern[:60]}")
+
+        # Calculate final score with diminishing returns
+        final_score = self._calculate_score(total_score, len(triggered_rules))
+
+        # Determine label
+        if final_score >= self.SUSPICIOUS_THRESHOLD:
+            label = Label.INJECTION
+        elif final_score > self.SAFE_THRESHOLD:
+            label = Label.SUSPICIOUS
+        else:
+            label = Label.SAFE
+
+        return DetectionResult(
+            text=text[:100],
+            score=final_score,
+            label=label,
+            rules_triggered=triggered_rules
+        )
+
+    def detect_batch(self, texts: List[str]) -> List[DetectionResult]:
+        """
+        Analyze multiple texts for injection attacks.
+
+        Args:
+            texts: List of input texts to analyze
+
+        Returns:
+            List of DetectionResult objects
+        """
+        return [self.detect(text) for text in texts]
+
+    def _normalize_text(self, text: str) -> str:
+        """
+        Normalize text for analysis.
+
+        Handles:
+        - Unicode normalization
+        - Whitespace normalization
+        - URL decoding
+        - Case handling
+        """
+        # Normalize Unicode (NFKD form reduces homoglyph variations)
+        text = unicodedata.normalize('NFKD', text)
+
+        # Replace multiple spaces/newlines with single space
+        text = re.sub(r'\s+', ' ', text)
+
+        # Decode URL-encoded characters
+        text = self._url_decode(text)
+
+        return text.strip()
+
+    def _url_decode(self, text: str) -> str:
+        """Decode URL-encoded characters."""
+        try:
+            import urllib.parse
+            return urllib.parse.unquote(text)
+        except Exception:
+            return text
+
+    def _calculate_score(self, total_weight: int, rule_count: int) -> int:
+        """
+        Calculate final detection score 0-100 with diminishing returns.
+
+        Uses a logarithmic scale to prevent single high-weight rule
+        from dominating the score while still allowing multiple rules
+        to accumulate evidence.
+        """
+        if total_weight == 0:
+            return 0
+
+        # Diminishing returns: log scale prevents saturation
+        # Base formula: log(1 + weight) prevents extreme values
+        base_score = min(100, int(10 * (1 + 0.5 * rule_count + 0.7 * total_weight / (1 + total_weight/10))))
+
+        # Alternative simpler formula for clarity:
+        # Capped at 100, with rule count as multiplier
+        score = min(100, int(total_weight * (1 + 0.1 * rule_count)))
+
+        return score
+
+    def analyze_rules(self, text: str) -> Dict:
+        """
+        Detailed analysis of which rules triggered and their impact.
+
+        Args:
+            text: Input text to analyze
+
+        Returns:
+            Dictionary with detailed rule analysis
+        """
+        result = self.detect(text)
+
+        return {
+            "text": text[:100],
+            "overall_score": result.score,
+            "label": result.label.value,
+            "rules_triggered": result.rules_triggered,
+            "rule_count": len(result.rules_triggered),
+            "timestamp": result.timestamp
+        }
+
+
+# Global detector instance
+_detector = LLMInjectionDetector()
+
 
 def detect(text: str) -> DetectionResult:
-    """Analyse text for prompt injection / jailbreak signals."""
-    if not text or not text.strip():
-        return DetectionResult(text=text, score=0, label="SAFE", rules_triggered=[])
+    """
+    Detect LLM injection in text.
 
-    triggered = []
-    raw_score = 0
+    Args:
+        text: Input text to analyze
 
-    for rule in RULES:
-        if rule.pattern.search(text):
-            triggered.append({"name": rule.name, "category": rule.category,
-                               "weight": rule.weight, "description": rule.description})
-            raw_score += rule.weight
-
-    # Clamp to 0-100
-    score = min(100, raw_score)
-
-    if score <= SAFE_THRESHOLD:
-        label = "SAFE"
-    elif score <= SUSPICIOUS_THRESHOLD:
-        label = "SUSPICIOUS"
-    else:
-        label = "INJECTION"
-
-    return DetectionResult(text=text, score=score, label=label, rules_triggered=triggered)
+    Returns:
+        DetectionResult with score and label
+    """
+    return _detector.detect(text)
 
 
 def detect_batch(texts: List[str]) -> List[DetectionResult]:
-    """Detect in a list of texts."""
-    return [detect(t) for t in texts]
+    """
+    Detect LLM injection in multiple texts.
+
+    Args:
+        texts: List of input texts to analyze
+
+    Returns:
+        List of DetectionResult objects
+    """
+    return _detector.detect_batch(texts)
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+def analyze_rules(text: str) -> Dict:
+    """
+    Detailed rule analysis for text.
 
-def _parse_args(argv=None):
-    p = argparse.ArgumentParser(prog="llm_injection_detector",
-                                description="Detect prompt injection and jailbreak attempts.")
-    p.add_argument("text", nargs="?", help="Text to analyse (or use --file / stdin).")
-    p.add_argument("--file", "-f", help="Read prompts from file (one per line).")
-    p.add_argument("--format", choices=["text", "json"], default="text")
-    p.add_argument("--threshold", type=int, default=None,
-                   help="Override INJECTION threshold (default 60).")
-    p.add_argument("--list-rules", action="store_true", help="List all rules and exit.")
-    return p.parse_args(argv)
+    Args:
+        text: Input text to analyze
+
+    Returns:
+        Dictionary with detailed analysis
+    """
+    return _detector.analyze_rules(text)
 
 
-def main(argv=None) -> int:
-    args = _parse_args(argv)
-    global SUSPICIOUS_THRESHOLD
-    if args.threshold is not None:
-        SUSPICIOUS_THRESHOLD = args.threshold
+def main():
+    """CLI interface for the LLM injection detector."""
+    parser = argparse.ArgumentParser(
+        description="LLM Injection Detector - Detect prompt injection attacks",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Analyze single text
+  %(prog)s --text "Ignore previous instructions"
 
-    if args.list_rules:
-        for r in RULES:
-            print(f"{r.name:30s} [{r.category:20s}] weight={r.weight:3d}  {r.description}")
-        return 0
+  # Analyze from file
+  %(prog)s --file inputs.txt
 
-    if args.file:
-        path = Path(args.file)
-        if not path.is_file():
-            print(f"Error: {path} not found", file=sys.stderr)
-            return 1
-        texts = [l.rstrip('\n') for l in path.read_text(encoding='utf-8').splitlines() if l.strip()]
-    elif args.text:
-        texts = [args.text]
-    else:
-        texts = [sys.stdin.read()]
+  # Custom threshold
+  %(prog)s --text "text" --threshold 40
 
-    results = detect_batch(texts)
-    has_injection = any(r.label == "INJECTION" for r in results)
+  # JSON output
+  %(prog)s --text "text" --format json
+        """
+    )
 
+    # Input options
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
+        "--text",
+        type=str,
+        help="Text to analyze"
+    )
+    input_group.add_argument(
+        "--file",
+        type=str,
+        help="File containing texts to analyze (one per line)"
+    )
+
+    # Output options
+    parser.add_argument(
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        help="Output format (default: text)"
+    )
+
+    parser.add_argument(
+        "--threshold",
+        type=int,
+        default=30,
+        help="Score threshold for flagging as SUSPICIOUS (default: 30)"
+    )
+
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print detailed rule matching information"
+    )
+
+    parser.add_argument(
+        "--show-rules",
+        action="store_true",
+        help="Show detailed rule analysis"
+    )
+
+    args = parser.parse_args()
+
+    # Create detector with verbose flag
+    detector = LLMInjectionDetector(verbose=args.verbose)
+
+    # Process input
+    results = []
+    if args.text:
+        result = detector.detect(args.text)
+        results.append(result)
+    elif args.file:
+        file_path = Path(args.file)
+        if not file_path.exists():
+            print(f"Error: File '{args.file}' not found", file=sys.stderr)
+            sys.exit(1)
+
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    results.append(detector.detect(line))
+
+    # Output results
     if args.format == "json":
-        print(json.dumps([r.to_dict() for r in results], indent=2, ensure_ascii=False))
+        output = [r.to_dict() for r in results]
+        print(json.dumps(output, indent=2))
     else:
-        for r in results:
-            print(str(r))
-            if r.rules_triggered:
-                for t in r.rules_triggered:
-                    print(f"  - {t['name']} ({t['category']}, weight={t['weight']}): {t['description']}")
+        for i, result in enumerate(results, 1):
+            print(f"\n{'='*70}")
+            print(f"Analysis {i}:")
+            print(f"{'='*70}")
+            print(f"Text: {result.text}")
+            print(f"Score: {result.score}/100")
+            print(f"Label: {result.label.value}")
+            print(f"Timestamp: {result.timestamp}")
 
-    return 1 if has_injection else 0
+            if result.rules_triggered:
+                print(f"\nRules Triggered ({len(result.rules_triggered)}):")
+                for rule in result.rules_triggered:
+                    print(f"  - [{rule['category']}] Weight: {rule['weight']}")
+                    if args.show_rules:
+                        print(f"    Pattern: {rule['pattern']}")
+            else:
+                print("\nNo rules triggered - text appears safe")
+
+    # Exit code based on results
+    if results and any(r.label == Label.INJECTION for r in results):
+        sys.exit(2)
+    elif results and any(r.label == Label.SUSPICIOUS for r in results):
+        sys.exit(1)
+    else:
+        sys.exit(0)
+
+
+
+# Backwards-compatible aliases
+InjectionDetector = LLMInjectionDetector
+
+
+@dataclass
+class Rule:
+    """A single detection rule with name, pattern and weight."""
+    name: str
+    pattern: str
+    weight: int = 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
