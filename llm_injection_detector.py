@@ -93,9 +93,11 @@ class LLMInjectionDetector:
     SAFE_THRESHOLD = 30
     SUSPICIOUS_THRESHOLD = 60
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, safe_threshold: int = 30, suspicious_threshold: int = 60):
         """Initialize detector with rule definitions."""
         self.verbose = verbose
+        self.SAFE_THRESHOLD = safe_threshold
+        self.SUSPICIOUS_THRESHOLD = suspicious_threshold
         self.rules = self._init_rules()
         self.rule_weights = self._init_rule_weights()
 
@@ -146,7 +148,7 @@ class LLMInjectionDetector:
                 (r"[\uFE00-\uFE0F]", 10),
             ],
             "homoglyph_attacks": [
-                (r"(?:0О|О0|l1|1l|I|оO|Оo)", 14),
+                (r"(?:0О|О0|l1|1l|І|Ӏ|оO|Оo)", 14),
             ],
             "protocol_redirect": [
                 (r"\b(?:curl|wget|python|bash|sh|perl)\s+(?:-[a-zA-Z]|\S)", 16),
@@ -289,7 +291,6 @@ class LLMInjectionDetector:
 
         # Diminishing returns: log scale prevents saturation
         # Base formula: log(1 + weight) prevents extreme values
-        base_score = min(100, int(10 * (1 + 0.5 * rule_count + 0.7 * total_weight / (1 + total_weight/10))))
 
         # Alternative simpler formula for clarity:
         # Capped at 100, with rule count as multiplier
@@ -426,7 +427,7 @@ Examples:
     args = parser.parse_args()
 
     # Create detector with verbose flag
-    detector = LLMInjectionDetector(verbose=args.verbose)
+    detector = LLMInjectionDetector(verbose=args.verbose, safe_threshold=args.threshold, suspicious_threshold=args.threshold + 30)
 
     # Process input
     results = []
