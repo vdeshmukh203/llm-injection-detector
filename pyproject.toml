@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-injection-detector"
-version = "0.1.0"
+version = "0.2.0"
 description = "Static and heuristic prompt injection and jailbreak detector for LLM applications"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -22,7 +22,11 @@ classifiers = [
 ]
 
 [project.scripts]
-llm-injection-detector = "llm_injection_detector:_cli"
+llm-injection-detector = "llm_injection_detector:main"
+llm-injection-detector-gui = "gui:launch_gui"
 
 [tool.setuptools]
-py-modules = ["llm_injection_detector"]
+py-modules = ["llm_injection_detector", "gui"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

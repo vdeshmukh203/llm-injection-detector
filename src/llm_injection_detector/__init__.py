@@ -1,18 +1,43 @@
 """
 llm_injection_detector: Static and heuristic prompt injection vulnerability detector.
 
-Scans prompt templates, RAG pipeline inputs, and LLM application code for
-prompt injection vulnerabilities. Implements pattern-based detectors for
-instruction-override phrases, role-reassignment attacks, and context-escape
-sequences, plus an optional taint-tracking pass for static analysis of
-untrusted data flows through Python LLM application code.
+This package re-exports the public API from the root-level module
+``llm_injection_detector``.  Install with ``pip install llm-injection-detector``
+and then::
+
+    from llm_injection_detector import detect, LLMInjectionDetector
+
+See the project README for full usage documentation.
 """
 
-__version__ = "0.1.0"
-__author__ = "Vaibhav Deshmukh"
-__license__ = "MIT"
+# The canonical implementation lives in the root-level module.
+# This shim makes the src/ layout importable for IDEs and editable installs.
+from llm_injection_detector import (  # noqa: F401
+    __author__,
+    __license__,
+    __version__,
+    Label,
+    Rule,
+    DetectionResult,
+    LLMInjectionDetector,
+    InjectionDetector,
+    detect,
+    detect_batch,
+    analyze_rules,
+    main,
+)
 
-from .detector import InjectionDetector
-from .report import DetectionReport
-
-__all__ = ["InjectionDetector", "DetectionReport"]
+__all__ = [
+    "__author__",
+    "__license__",
+    "__version__",
+    "Label",
+    "Rule",
+    "DetectionResult",
+    "LLMInjectionDetector",
+    "InjectionDetector",
+    "detect",
+    "detect_batch",
+    "analyze_rules",
+    "main",
+]
