@@ -22,7 +22,8 @@ classifiers = [
 ]
 
 [project.scripts]
-llm-injection-detector = "llm_injection_detector:_cli"
+llm-injection-detector = "llm_injection_detector:main"
+llm-injection-detector-gui = "gui:main"
 
 [tool.setuptools]
-py-modules = ["llm_injection_detector"]
+py-modules = ["llm_injection_detector", "gui"]
