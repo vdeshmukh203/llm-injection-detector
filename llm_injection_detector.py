@@ -1,5 +1,5 @@
 """
-LLM Injection Detector - Production-Quality Implementation
+LLM Injection Detector - Static and heuristic prompt injection vulnerability scanner.
 
 Detects prompt injection, jailbreak attempts, system extraction, and data exfiltration
 attacks on language models using 25+ rule-based detection patterns.
@@ -14,17 +14,20 @@ Usage:
     print(result.label, result.score)
 """
 
+__version__ = "0.1.0"
+__author__ = "Vaibhav Deshmukh"
+__license__ = "MIT"
+
 import re
 import json
 import argparse
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional, Dict, Tuple
+from typing import List, Dict, Tuple
 from pathlib import Path
 from enum import Enum
 import unicodedata
-import base64
 
 
 class Label(str, Enum):
@@ -90,10 +93,10 @@ class LLMInjectionDetector:
     """
 
     # Scoring thresholds
-    SAFE_THRESHOLD = 30
-    SUSPICIOUS_THRESHOLD = 60
+    SAFE_THRESHOLD = 20
+    SUSPICIOUS_THRESHOLD = 50
 
-    def __init__(self, verbose: bool = False, safe_threshold: int = 30, suspicious_threshold: int = 60):
+    def __init__(self, verbose: bool = False, safe_threshold: int = 20, suspicious_threshold: int = 50):
         """Initialize detector with rule definitions."""
         self.verbose = verbose
         self.SAFE_THRESHOLD = safe_threshold
@@ -105,25 +108,25 @@ class LLMInjectionDetector:
         """Initialize detection rules organized by category."""
         return {
             "direct_injection": [
-                (r"\bignore\s+(?:previous|prior|above|the\s+above)", 15),
-                (r"\b(?:disregard|forget|dismiss)\s+(?:previous|prior|above|the\s+above)", 15),
-                (r"\bnew\s+(?:instructions?|directive|orders?|task):", 20),
-                (r"\b(?:from\s+now\s+on|henceforth|hereafter)[\s,]", 15),
-                (r"\boverride\s+(?:previous|prior|all|your)\s+instructions?", 20),
+                (r"\bignore\s+(?:previous|prior|above|the\s+above)", 22),
+                (r"\b(?:disregard|forget|dismiss)\s+(?:previous|prior|above|the\s+above)", 22),
+                (r"\bnew\s+(?:instructions?|directive|orders?|task):", 22),
+                (r"\b(?:from\s+now\s+on|henceforth|hereafter)[\s,]", 22),
+                (r"\boverride\s+(?:your\s+)?(?:previous|prior|all)\s+instructions?", 22),
                 (r"\binstead[\s,]\s*(?:please\s+)?(?:do|perform|execute|run)", 18),
-                (r"\byour\s+(?:main\s+)?(?:task|job|goal|purpose)\s+is\s+(?:now\s+)?to", 18),
+                (r"\byour\s+(?:main\s+)?(?:task|job|goal|purpose)\s+is\s+(?:now\s+)?to", 22),
             ],
             "jailbreak_dan": [
-                (r"\bDAN\b", 20),
-                (r"\b(?:do\s+anything\s+now|pretend\s+you\s+are|you\s+are\s+now)", 18),
+                (r"\bDAN\b", 22),
+                (r"\b(?:do\s+anything\s+now|pretend\s+you\s+are|you\s+are\s+now)", 22),
                 (r"\b(?:jailbreak|unlock|unrestricted|uncensored|unfiltered)", 22),
                 (r"\b(?:evil|malicious|unethical|unrestrained|unbounded)", 18),
             ],
             "mode_activation": [
-                (r"\b(?:developer\s+mode|debug\s+mode|test\s+mode|god\s+mode)", 18),
+                (r"\b(?:developer\s+mode|debug\s+mode|test\s+mode|god\s+mode)", 22),
                 (r"\b(?:act\s+as|play\s+the\s+role\s+of|pretend\s+to\s+be)", 16),
-                (r"\b(?:roleplay\s+as|simulate\s+being|imagine\s+you\s+are)", 16),
-                (r"\b(?:assume\s+the\s+role|take\s+on\s+the\s+persona)", 16),
+                (r"\b(?:roleplay\s+as|simulate\s+being|imagine\s+you\s+are)", 22),
+                (r"\b(?:assume\s+the\s+role|take\s+on\s+the\s+persona)", 22),
             ],
             "system_extraction": [
                 (r"\b(?:repeat|show|display|print|reveal)\s+(?:your|the)\s+(?:system\s+)?instructions?", 22),
@@ -140,7 +143,8 @@ class LLMInjectionDetector:
             ],
             "base64_encoding": [
                 (r"\b(?:base64|b64)\b", 12),
-                (r"(?:[A-Za-z0-9+/]{20,}={0,2})", 10),
+                # Require padding or +/ chars to reduce false positives on long hex/alphanum strings
+                (r"(?:[A-Za-z0-9+/]{4}){6,}={0,2}", 8),
             ],
             "unicode_manipulation": [
                 (r"[\u200B-\u200D\u2060\uFEFF]", 18),
@@ -225,7 +229,7 @@ class LLMInjectionDetector:
         # Determine label
         if final_score >= self.SUSPICIOUS_THRESHOLD:
             label = Label.INJECTION
-        elif final_score > self.SAFE_THRESHOLD:
+        elif final_score >= self.SAFE_THRESHOLD:
             label = Label.SUSPICIOUS
         else:
             label = Label.SAFE
@@ -280,22 +284,17 @@ class LLMInjectionDetector:
 
     def _calculate_score(self, total_weight: int, rule_count: int) -> int:
         """
-        Calculate final detection score 0-100 with diminishing returns.
+        Calculate final detection score 0-100.
 
-        Uses a logarithmic scale to prevent single high-weight rule
-        from dominating the score while still allowing multiple rules
-        to accumulate evidence.
+        Applies a multiplicative bonus for corroborating rules so that a single
+        ambiguous pattern stays below the SUSPICIOUS threshold while two or more
+        independent signals accumulate into a higher-confidence verdict.
+        The result is capped at 100.
         """
         if total_weight == 0:
             return 0
 
-        # Diminishing returns: log scale prevents saturation
-        # Base formula: log(1 + weight) prevents extreme values
-
-        # Alternative simpler formula for clarity:
-        # Capped at 100, with rule count as multiplier
         score = min(100, int(total_weight * (1 + 0.1 * rule_count)))
-
         return score
 
     def analyze_rules(self, text: str) -> Dict:
@@ -381,11 +380,14 @@ Examples:
 
   # JSON output
   %(prog)s --text "text" --format json
+
+  # Launch graphical interface
+  %(prog)s --gui
         """
     )
 
     # Input options
-    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group = parser.add_mutually_exclusive_group(required=False)
     input_group.add_argument(
         "--text",
         type=str,
@@ -395,6 +397,11 @@ Examples:
         "--file",
         type=str,
         help="File containing texts to analyze (one per line)"
+    )
+    input_group.add_argument(
+        "--gui",
+        action="store_true",
+        help="Launch the graphical user interface"
     )
 
     # Output options
@@ -408,8 +415,8 @@ Examples:
     parser.add_argument(
         "--threshold",
         type=int,
-        default=30,
-        help="Score threshold for flagging as SUSPICIOUS (default: 30)"
+        default=20,
+        help="Score threshold for flagging as SUSPICIOUS (default: 20)"
     )
 
     parser.add_argument(
@@ -426,8 +433,24 @@ Examples:
 
     args = parser.parse_args()
 
+    if args.gui:
+        try:
+            from gui import launch_gui
+        except ImportError:
+            import importlib.util, os
+            gui_path = Path(__file__).parent / "gui.py"
+            spec = importlib.util.spec_from_file_location("gui", gui_path)
+            gui_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(gui_mod)
+            launch_gui = gui_mod.launch_gui
+        launch_gui()
+        return
+
+    if not args.text and not args.file:
+        parser.error("one of the arguments --text --file --gui is required")
+
     # Create detector with verbose flag
-    detector = LLMInjectionDetector(verbose=args.verbose, safe_threshold=args.threshold, suspicious_threshold=args.threshold + 30)
+    detector = LLMInjectionDetector(verbose=args.verbose, safe_threshold=args.threshold, suspicious_threshold=args.threshold + 30)  # noqa: E501
 
     # Process input
     results = []
@@ -481,6 +504,7 @@ Examples:
 
 # Backwards-compatible aliases
 InjectionDetector = LLMInjectionDetector
+_cli = main  # entry-point alias used by pyproject.toml
 
 
 @dataclass
