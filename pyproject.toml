@@ -17,12 +17,25 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Security",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
+[project.optional-dependencies]
+gui = ["flask>=2.0"]
+dev = ["pytest>=7.0", "flask>=2.0"]
+
 [project.scripts]
 llm-injection-detector = "llm_injection_detector:_cli"
+llm-injection-detector-gui = "llm_injection_detector_gui:main"
 
 [tool.setuptools]
-py-modules = ["llm_injection_detector"]
+py-modules = ["llm_injection_detector", "llm_injection_detector_gui"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
