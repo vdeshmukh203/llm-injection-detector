@@ -1,18 +1,50 @@
 """
 llm_injection_detector: Static and heuristic prompt injection vulnerability detector.
 
-Scans prompt templates, RAG pipeline inputs, and LLM application code for
-prompt injection vulnerabilities. Implements pattern-based detectors for
-instruction-override phrases, role-reassignment attacks, and context-escape
-sequences, plus an optional taint-tracking pass for static analysis of
-untrusted data flows through Python LLM application code.
+Re-exports the public API from the root module so that both import styles work:
+
+    import llm_injection_detector as lid          # root module (installed as py-module)
+    from llm_injection_detector import detect     # same
 """
 
-__version__ = "0.1.0"
-__author__ = "Vaibhav Deshmukh"
-__license__ = "MIT"
+import sys
+import os
 
-from .detector import InjectionDetector
-from .report import DetectionReport
+# Make the repo root importable when this package is used from the src/ layout.
+_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _root not in sys.path:
+    sys.path.insert(0, _root)
 
-__all__ = ["InjectionDetector", "DetectionReport"]
+from llm_injection_detector import (  # noqa: E402
+    __version__,
+    __author__,
+    __license__,
+    Label,
+    Rule,
+    DetectionResult,
+    LLMInjectionDetector,
+    InjectionDetector,
+    detect,
+    detect_batch,
+    analyze_rules,
+    main,
+)
+
+# Backwards-compatible alias used in older tests
+DetectionReport = DetectionResult
+
+__all__ = [
+    "__version__",
+    "__author__",
+    "__license__",
+    "Label",
+    "Rule",
+    "DetectionResult",
+    "DetectionReport",
+    "LLMInjectionDetector",
+    "InjectionDetector",
+    "detect",
+    "detect_batch",
+    "analyze_rules",
+    "main",
+]
